@@ -86,6 +86,33 @@ class BasicBlock(nn.Module):
         self.downsample = downsample
         self.stride = stride
 
+    def modules_to_fuse(self, prefix):
+        """
+        This function takes a 'prefix' and creates a list of tuples containing
+        names of modules to fuse. These are mostly convolutional layers followed
+        by batch normalization and ReLU activation. Depending on downsampling
+        feature flagged modules from downsample layer may also be included.
+
+        Args:
+            prefix (str): The `prefix` parameter specifies the prefix to be added
+                to each name of the modules being fused. This is used to create
+                meaningful names for the modules that are combined and will be
+                useful during debugging.
+
+        Returns:
+            list: The output of the given function is a list containing multiple
+            lists of strings representing the modules to be fused together.
+
+        """
+        modules_to_fuse_ = []
+        modules_to_fuse_.append([f'{prefix}.conv1', f'{prefix}.bn1', f'{prefix}.relu'])
+        modules_to_fuse_.append([f'{prefix}.conv2', f'{prefix}.bn2'])
+        if self.downsample:
+            modules_to_fuse_.append([f'{prefix}.downsample.0', f'{prefix}.downsample.1'])
+
+        return modules_to_fuse_
+        
+    
     def forward(self, x: Tensor) -> Tensor:
         identity = x
 
@@ -95,64 +122,6 @@ class BasicBlock(nn.Module):
 
         out = self.conv2(out)
         out = self.bn2(out)
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out += identity
-        out = self.relu(out)
-
-        return out
-
-
-class Bottleneck(nn.Module):
-    # Bottleneck in torchvision places the stride for downsampling at 3x3 convolution(self.conv2)
-    # while original implementation places the stride at the first 1x1 convolution(self.conv1)
-    # according to "Deep residual learning for image recognition" https://arxiv.org/abs/1512.03385.
-    # This variant is also known as ResNet V1.5 and improves accuracy according to
-    # https://ngc.nvidia.com/catalog/model-scripts/nvidia:resnet_50_v1_5_for_pytorch.
-
-    expansion: int = 4
-
-    def __init__(
-        self,
-        inplanes: int,
-        planes: int,
-        stride: int = 1,
-        downsample: Optional[nn.Module] = None,
-        groups: int = 1,
-        base_width: int = 64,
-        dilation: int = 1,
-        norm_layer: Optional[Callable[..., nn.Module]] = None,
-    ) -> None:
-        super().__init__()
-        if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
-        width = int(planes * (base_width / 64.0)) * groups
-        # Both self.conv2 and self.downsample layers downsample the input when stride != 1
-        self.conv1 = conv1x1(inplanes, width)
-        self.bn1 = norm_layer(width)
-        self.conv2 = conv3x3(width, width, stride, groups, dilation)
-        self.bn2 = norm_layer(width)
-        self.conv3 = conv1x1(width, planes * self.expansion)
-        self.bn3 = norm_layer(planes * self.expansion)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-        self.stride = stride
-
-    def forward(self, x: Tensor) -> Tensor:
-        identity = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.relu(out)
-
-        out = self.conv3(out)
-        out = self.bn3(out)
 
         if self.downsample is not None:
             identity = self.downsample(x)
@@ -166,7 +135,7 @@ class Bottleneck(nn.Module):
 class ResNet(nn.Module):
     def __init__(
         self,
-        block: Type[Union[BasicBlock, Bottleneck]],
+        block: Type[BasicBlock],
         layers: List[int],
         num_classes: int = 1000,
         zero_init_residual: bool = False,
@@ -204,7 +173,9 @@ class ResNet(nn.Module):
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512 * block.expansion, num_classes)
-
+        self.quant   = torch.ao.quantization.QuantStub()
+        self.dequant = torch.ao.quantization.DeQuantStub()
+                        
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
@@ -224,7 +195,7 @@ class ResNet(nn.Module):
 
     def _make_layer(
         self,
-        block: Type[Union[BasicBlock, Bottleneck]],
+        block: Type[BasicBlock],
         planes: int,
         blocks: int,
         stride: int = 1,
@@ -262,6 +233,51 @@ class ResNet(nn.Module):
             )
 
         return nn.Sequential(*layers)
+    
+    def modules_to_fuse(self):
+        """
+        This function constructs a list of tuples containing the names of PyTorch
+        modules to fuse (e.g., "conv1", "bn1", etc.), based on the structure of
+        the neural network defined using the `self` context (i.e., an instance of
+        a class with attributes `layer1`, `layer2`, `layer3`, and `layer4`). Specifically:
+        - It first initializes an empty list `modules_to_fuse_`.
+        - Then it appends a tuple containing the names of modules to fuse for the
+        first layer (`conv1`, `bn1`, `relu`).
+        Next is a loop over the remaining layers (`layer1`, `layer2`, and `layer3`)
+        using an explicit list comprehension and the eval() function to extract
+        each layer as an instance of some class (probably self.layerX):
+        - for each layer (in ['layer1', 'layer2', 'layer3', 'layer4'])
+           obtains its module's modules to fuse (self.layerX[block_nb].modules_to_fuse(
+        prefix ) ) by running eval() on the str() representation of the layer.
+        - extends the initial list with each iteration result.
+        Finally it returns a list of tuples containing the names of PyTorch modules
+        to fuse after the loop completes its iteration over self.layer1 up to and
+        including self.layer4 .
+        In sum: it defines which PyTorch modules to fuse for the layers (up until
+        layer 4) within the given neural network object instance so that they can
+        be efficiently executed on various devices supported by FusePool2
+
+        Returns:
+            list: The function "modules_to_fuse" takes a self-object as input and
+            returns a list of lists with the names of the layers (as strings) that
+            are to be fused together. The list of layers is generated by iterating
+            through the layers of the model and fetching their module fusion
+            information using eval() to fetch attributes of the layers using string
+            names
+
+        """
+        modules_to_fuse_ = []
+        modules_to_fuse_.append(['conv1', 'bn1', 'relu'])
+
+        for layer_str in ['layer1', 'layer2', 'layer3', 'layer4']:
+            layer = eval(f'self.{layer_str}')
+            for block_nb in range(len(layer)):
+                prefix = f'{layer_str}.{block_nb}'
+                modules_to_fuse_layer = layer[block_nb].modules_to_fuse(prefix)
+                modules_to_fuse_.extend(modules_to_fuse_layer)
+
+        return modules_to_fuse_
+        
 
     def _forward_impl(self, x: Tensor) -> Tensor:
         # See note [TorchScript super()]
@@ -282,11 +298,14 @@ class ResNet(nn.Module):
         return x
 
     def forward(self, x: Tensor) -> Tensor:
-        return self._forward_impl(x)
+        x = self.quant(x)
+        x = self._forward_impl(x)
+        x = self.dequant(x)        
+        return x
 
 
 def _resnet(
-    block: Type[Union[BasicBlock, Bottleneck]],
+    block: Type[BasicBlock],
     layers: List[int],
     weights: Optional[WeightsEnum],
     progress: bool,
