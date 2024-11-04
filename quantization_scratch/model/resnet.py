@@ -55,7 +55,6 @@ def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
     """1x1 convolution"""
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
-
 class BasicBlock(nn.Module):
     expansion: int = 1
 
@@ -70,6 +69,7 @@ class BasicBlock(nn.Module):
         dilation: int = 1,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
     ) -> None:
+                
         super().__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
@@ -80,11 +80,12 @@ class BasicBlock(nn.Module):
         # Both self.conv1 and self.downsample layers downsample the input when stride != 1
         self.conv1 = conv3x3(inplanes, planes, stride)
         self.bn1 = norm_layer(planes)
-        self.relu = nn.ReLU(inplace=True)
+        self.relu1 = nn.ReLU(inplace=True)
         self.conv2 = conv3x3(planes, planes)
         self.bn2 = norm_layer(planes)
         self.downsample = downsample
         self.stride = stride
+        self.add_relu_FF = torch.ao.nn.quantized.FloatFunctional()
 
     def modules_to_fuse(self, prefix):
         """
@@ -105,20 +106,33 @@ class BasicBlock(nn.Module):
 
         """
         modules_to_fuse_ = []
-        modules_to_fuse_.append([f'{prefix}.conv1', f'{prefix}.bn1', f'{prefix}.relu'])
+        modules_to_fuse_.append([f'{prefix}.conv1', f'{prefix}.bn1', f'{prefix}.relu1'])
         modules_to_fuse_.append([f'{prefix}.conv2', f'{prefix}.bn2'])
         if self.downsample:
             modules_to_fuse_.append([f'{prefix}.downsample.0', f'{prefix}.downsample.1'])
 
         return modules_to_fuse_
-        
-    
+
     def forward(self, x: Tensor) -> Tensor:
+        """
+        This function performs a convolutional layer using two convolutional layers
+        with batch normalization and ReLU activation functions between them. It
+        also includes an optional downsampling step.
+
+        Args:
+            x (Tensor): In this code snippet `x` is just an input tensor that is
+                passed through a series of operations such as conv1 & batch
+                normalization (bn1). No changes are made to x.
+
+        Returns:
+            Tensor: The output returned by the function "forward" is "out".
+
+        """
         identity = x
 
         out = self.conv1(x)
         out = self.bn1(out)
-        out = self.relu(out)
+        out = self.relu1(out)
 
         out = self.conv2(out)
         out = self.bn2(out)
@@ -126,11 +140,9 @@ class BasicBlock(nn.Module):
         if self.downsample is not None:
             identity = self.downsample(x)
 
-        out += identity
-        out = self.relu(out)
+        out = self.add_relu_FF.add_relu(out, identity)
 
         return out
-
 
 class ResNet(nn.Module):
     def __init__(
