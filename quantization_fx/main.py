@@ -265,4 +265,4 @@ input = example_inputs[0]
 out = transformed(input) # Test we can feed something through the model
 print('\nTransformed model evaluation:')
 evaluate(transformed, 'cpu')
-XXX
+
